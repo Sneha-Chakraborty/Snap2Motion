@@ -25,6 +25,7 @@ function toIntOrUndefined(x?: string) {
 export async function POST(req: Request) {
   try {
     const form = await req.formData();
+
     const image = form.get("image");
     if (!(image instanceof File)) {
       return NextResponse.json({ error: "Missing image file." }, { status: 400 });
@@ -44,24 +45,58 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
     }
 
-    const { owner, name } = getModelId();
-    const replicate = getReplicate();
+    
+    let replicate;
+    try {
+      replicate = getReplicate();
+    } catch (e: any) {
+      return NextResponse.json(
+        {
+          error:
+            e?.message ??
+            "Missing REPLICATE_API_TOKEN. This endpoint requires Replicate credentials.",
+        },
+        { status: 400 }
+      );
+    }
 
-    // Fetch model schema so we can safely map input keys (works even if the model changes input names).
+    const { owner, name } = getModelId();
+
+    // Fetch model info
     const model = await replicate.models.get(owner, name);
 
-    const openapi = model?.latest_version?.openapi_schema;
-    if (!openapi) {
+    const version =
+      process.env.REPLICATE_MODEL_VERSION ?? model.latest_version?.id;
+
+    if (!version) {
       return NextResponse.json(
-        { error: "Could not fetch model schema (openapi_schema missing). Try again later." },
+        {
+          error:
+            "Replicate model version not found (latest_version missing). " +
+            "Set REPLICATE_MODEL_VERSION in env or choose a model that exposes latest_version.",
+        },
         { status: 500 }
       );
     }
 
-    const resolved = resolveInputKeys(openapi);
+    // Try to read the model schema to map correct input keys.
+    // If openapi_schema is missing, fall back to common keys.
+    const openapi = model.latest_version?.openapi_schema ?? null;
+
+    const resolved = openapi
+      ? resolveInputKeys(openapi)
+      : {
+          // Fallback mapping (best-effort)
+          promptKey: "prompt",
+          imageKey: "image",
+          seedKey: "seed",
+          durationKey: undefined as string | undefined,
+          extraDefaults: {} as Record<string, unknown>,
+        };
+
     const seed = toIntOrUndefined(parsed.data.seed);
 
-    const prompt = buildDirectorPrompt({
+    const directorPrompt = buildDirectorPrompt({
       userPrompt: parsed.data.prompt,
       camera: parsed.data.camera as CameraMove,
       durationSec: parsed.data.durationSec,
@@ -73,27 +108,29 @@ export async function POST(req: Request) {
 
     const input: Record<string, unknown> = {
       ...resolved.extraDefaults,
-      [resolved.promptKey]: prompt,
+      [resolved.promptKey]: directorPrompt,
     };
 
-    // If the model has a dedicated duration input, pass it; otherwise it is already embedded in prompt.
+    // If the model has a dedicated duration input, pass it.
     if (resolved.durationKey) input[resolved.durationKey] = parsed.data.durationSec;
 
     if (resolved.seedKey && typeof seed === "number") input[resolved.seedKey] = seed;
 
     if (resolved.imageKey) {
-      // The Replicate client automatically uploads Buffers/files and passes them as file URLs.
+      // Replicate client will upload Buffer and provide a file URL internally.
       input[resolved.imageKey] = imageBuffer;
     } else {
-      // Some models are text-only; we still allow it, but this assignment expects image-to-video.
       return NextResponse.json(
-        { error: "This model schema did not expose an image input. Pick a model that supports image-to-video." },
+        {
+          error:
+            "This model schema did not expose an image input. Pick a model that supports image-to-video.",
+        },
         { status: 400 }
       );
     }
 
     const prediction = await replicate.predictions.create({
-      version: model.latest_version.id,
+      version,
       input,
     });
 
@@ -102,6 +139,7 @@ export async function POST(req: Request) {
       status: prediction.status,
       created_at: prediction.created_at,
       model: `${owner}/${name}`,
+      used_schema: Boolean(openapi),
     });
   } catch (err: any) {
     console.error(err);
