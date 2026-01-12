@@ -1,0 +1,23 @@
+# dependencies
+node_modules
+
+# next
+.next
+out
+
+# production
+dist
+
+# misc
+.DS_Store
+*.pem
+*.log
+
+# env
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode
+.idea
